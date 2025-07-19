@@ -1,0 +1,194 @@
+from flask import Flask, request, jsonify
+from werkzeug.exceptions import BadRequest
+import logging
+import os
+from google.cloud import aiplatform, texttospeech, storage
+from google.protobuf import json_format
+import tempfile
+import subprocess  # For video generation (you might use FFmpeg)
+
+app = Flask(__name__)
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Google Cloud Setup
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "path/to/your/service-account.json"  # Update this path
+
+# Initialize clients
+tts_client = texttospeech.TextToSpeechClient()
+storage_client = storage.Client()
+aiplatform.init(project="your-project-id", location="us-central1")
+
+# Cloud Storage Bucket
+BUCKET_NAME = "your-video-bucket"
+
+@app.route("/")
+def home():
+    """Health check endpoint"""
+    return jsonify({"status": "running", "message": "Backend service is operational"})
+
+@app.route("/create_video", methods=['POST'])
+def create_video():
+    """
+    Endpoint for video creation requests.
+    Expected JSON payload:
+    {
+        "topic": str,
+        "style": str,
+        "language": str,
+        "tone": str,
+        "weaknesses": list[str],
+        "character": str
+    }
+    """
+    try:
+        # Validate request content type
+        if not request.is_json:
+            logger.warning("Invalid content type received")
+            raise BadRequest("Request must be JSON")
+        
+        data = request.get_json()
+        logger.info(f"Received request data: {data}")
+
+        # Validate required fields
+        required_fields = {
+            "topic": str,
+            "style": str,
+            "language": str,
+            "tone": str,
+            "weaknesses": list,
+            "character": str
+        }
+
+        missing_fields = [field for field in required_fields if field not in data or not data[field]]
+        if missing_fields:
+            error_msg = f"Missing required fields: {', '.join(missing_fields)}"
+            logger.warning(error_msg)
+            return jsonify({"error": error_msg}), 400
+
+        # Validate field types
+        type_errors = []
+        for field, expected_type in required_fields.items():
+            if not isinstance(data[field], expected_type):
+                type_errors.append(
+                    f"{field} should be {expected_type.__name__}, got {type(data[field]).__name__}"
+                )
+
+        if type_errors:
+            error_msg = f"Type errors: {'; '.join(type_errors)}"
+            logger.warning(error_msg)
+            return jsonify({"error": error_msg}), 400
+
+        # 1. Generate script using Vertex AI (Gemini)
+        logger.info("Generating script using Vertex AI")
+        prompt = f"""
+        Create a {data['style']}-style video script about {data['topic']} 
+        in {data['language']} with a {data['tone']} tone.
+        Character: {data['character']}
+        Avoid: {', '.join(data['weaknesses'])}
+        """
+        
+        model = aiplatform.Endpoint("projects/your-project-id/locations/us-central1/publishers/google/models/text-bison@001")
+        response = model.predict(
+            instances=[{"prompt": prompt}],
+            parameters={
+                "temperature": 0.2,
+                "maxOutputTokens": 1024,
+                "topP": 0.8,
+                "topK": 40
+            }
+        )
+        script = response.predictions[0]['content']
+        logger.info(f"Generated script: {script[:200]}...")  # Log first 200 chars
+
+        # 2. Generate audio using Text-to-Speech
+        logger.info("Generating audio using Text-to-Speech")
+        synthesis_input = texttospeech.SynthesisInput(text=script)
+        
+        # Configure voice based on language and tone
+        voice = texttospeech.VoiceSelectionParams(
+            language_code=data['language'],
+            name=f"{data['language']}-Standard-A",  # Example voice
+            ssml_gender=texttospeech.SsmlVoiceGender.FEMALE if "female" in data['tone'].lower() else texttospeech.SsmlVoiceGender.MALE
+        )
+        
+        audio_config = texttospeech.AudioConfig(
+            audio_encoding=texttospeech.AudioEncoding.MP3
+        )
+        
+        audio_response = tts_client.synthesize_speech(
+            input=synthesis_input,
+            voice=voice,
+            audio_config=audio_config
+        )
+
+        # 3. Store assets in Cloud Storage
+        logger.info("Storing assets in Cloud Storage")
+        bucket = storage_client.bucket(BUCKET_NAME)
+        
+        # Save script
+        script_blob = bucket.blob(f"scripts/{data['topic']}.txt")
+        script_blob.upload_from_string(script)
+        
+        # Save audio
+        audio_blob = bucket.blob(f"audio/{data['topic']}.mp3")
+        audio_blob.upload_from_string(audio_response.audio_content)
+        
+        # 4. Generate video (simplified example - you might use FFmpeg or a video editing API)
+        # This is a placeholder - you'd replace with your actual video generation logic
+        logger.info("Generating video (placeholder)")
+        video_url = generate_video_placeholder(script, audio_response.audio_content, data)
+        
+        response_data = {
+            "status": "completed",
+            "message": "Video generated successfully",
+            "assets": {
+                "script_url": script_blob.public_url,
+                "audio_url": audio_blob.public_url,
+                "video_url": video_url
+            },
+            "metadata": {
+                "topic": data["topic"],
+                "language": data["language"],
+                "duration": "00:02:30"  # Example duration
+            }
+        }
+        
+        return jsonify(response_data), 200
+
+    except BadRequest as e:
+        logger.error(f"Bad request: {str(e)}")
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        logger.error(f"Unexpected error: {str(e)}", exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
+
+def generate_video_placeholder(script, audio_content, metadata):
+    """
+    Placeholder for video generation logic.
+    In a real implementation, you would:
+    - Combine audio with images/video clips
+    - Add subtitles/text overlays
+    - Use FFmpeg or a video editing API
+    """
+    # This is a simplified example that just uploads a placeholder
+    bucket = storage_client.bucket(BUCKET_NAME)
+    video_blob = bucket.blob(f"videos/{metadata['topic']}_placeholder.mp4")
+    
+    # In a real app, you would generate an actual video file here
+    # For now, we'll just upload a small placeholder file
+    placeholder_content = b"PLACEHOLDER FOR VIDEO CONTENT"
+    video_blob.upload_from_string(placeholder_content)
+    
+    return video_blob.public_url
+
+if __name__ == '__main__':
+    # Configure for production
+    app.run(
+        host='0.0.0.0',
+        port=5000,
+        debug=False  # Debug should be False in production
+    )
+
